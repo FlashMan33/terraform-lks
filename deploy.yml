@@ -1,0 +1,74 @@
+name: Deploy Infrastructure and App
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      TF_IN_AUTOMATION: true
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Prepare tfvars
+        working-directory: terraform
+        run: |
+          cp terraform.tfvars.example terraform.tfvars
+          sed -i "s|db_password        = "ChangeMe123!"|db_password        = "${{ secrets.DB_PASSWORD }}"|" terraform.tfvars
+          sed -i "s|notification_email = "you@example.com"|notification_email = "${{ secrets.NOTIFICATION_EMAIL }}"|" terraform.tfvars
+          sed -i "s|project_name       = "lks-terraform-yourname"|project_name       = "${{ secrets.PROJECT_NAME }}"|" terraform.tfvars
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Read Terraform Outputs
+        id: tf
+        working-directory: terraform
+        run: |
+          echo "ecr=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+          echo "asg=$(terraform output -raw asg_name)" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker image
+        working-directory: app
+        run: |
+          docker build -t ${{ steps.tf.outputs.ecr }}:latest .
+          docker push ${{ steps.tf.outputs.ecr }}:latest
+
+      - name: Start ASG Instance Refresh
+        run: |
+          aws autoscaling start-instance-refresh             --auto-scaling-group-name "${{ steps.tf.outputs.asg }}"             --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":120}'
